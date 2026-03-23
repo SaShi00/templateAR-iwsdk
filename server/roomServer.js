@@ -12,7 +12,10 @@ console.log(`room server listening on ws://localhost:${PORT}`);
 const clients = new Map();
 let modelState = null;
 let currentOwner = null;
-let anchor = null;
+let roomMarkerID = null;
+let roomMarkerCornersWorld = null;
+let roomMarkerCornersLocal = null;
+let roomMarkerSizeMeters = null;
 
 function broadcast(msg, except = null) {
   const raw = JSON.stringify(msg);
@@ -30,23 +33,6 @@ wss.on("connection", (ws) => {
     ws.send(JSON.stringify({ t: "welcome", clientId: id }));
   } catch (e) {}
 
-  // Immediately send current state (helpful for new joiners)
-  if (modelState) {
-    try {
-      ws.send(JSON.stringify({ t: "model_state", state: modelState }));
-    } catch (e) {}
-  }
-  if (anchor) {
-    try {
-      ws.send(
-        JSON.stringify({
-          t: "anchor_created",
-          anchor,
-        }),
-      );
-    } catch (e) {}
-  }
-
   ws.on("message", async (data) => {
     let msg;
     try {
@@ -61,32 +47,21 @@ wss.on("connection", (ws) => {
 
     if (msg.t === "hello") {
       console.log(`[Room] hello from ${id}`);
-      // send current modelState and anchor
-      if (modelState)
-        ws.send(JSON.stringify({ t: "model_state", state: modelState }));
-      if (anchor)
-        ws.send(
-          JSON.stringify({
-            t: "anchor_created",
-            anchor,
-          }),
-        );
-    } else if (msg.t === "create_anchor") {
-      if (!anchor) {
-        anchor = {
-          anchorID:
-            msg.anchor?.anchorID ||
-            `anchor-${(msg.clientId || id).slice(0, 8)}`,
-          pos: msg.anchor.pos,
-          rot: msg.anchor.rot,
-          clientId: msg.clientId || id,
-          timestamp: msg.anchor.timestamp || Date.now(),
-        };
-        broadcast({ t: "anchor_created", anchor });
-        console.log(`[Room] anchor created by ${anchor.clientId}`);
-      } else {
-        ws.send(JSON.stringify({ t: "anchor_created", anchor }));
+      if (msg.markerID) {
+        if (!roomMarkerID) {
+          roomMarkerID = msg.markerID;
+        } else if (roomMarkerID !== msg.markerID) {
+          console.warn(
+            `[Room] marker mismatch: expected ${roomMarkerID}, received ${msg.markerID}`,
+          );
+        }
       }
+      if (
+        modelState &&
+        msg.markerID &&
+        (!roomMarkerID || roomMarkerID === msg.markerID)
+      )
+        ws.send(JSON.stringify({ t: "model_state", state: modelState }));
     } else if (msg.t === "grab_request") {
       console.log(`[Room] grab_request from ${id}`);
       // grant immediately for simplicity if no owner
@@ -109,15 +84,44 @@ wss.on("connection", (ws) => {
     } else if (msg.t === "model_update") {
       console.log(`[Room] model_update from ${id} owner=${currentOwner}`);
       // update authoritative state and broadcast to others
+      // If this update includes marker corner info, only accept it if we
+      // haven't already recorded marker corners for this room (first scanner).
+      if (
+        msg.state &&
+        msg.state.markerCornersWorld &&
+        !roomMarkerCornersWorld
+      ) {
+        roomMarkerCornersWorld = msg.state.markerCornersWorld;
+        roomMarkerCornersLocal = msg.state.markerCornersLocal || null;
+        roomMarkerSizeMeters = msg.state.markerSizeMeters || null;
+        console.log(`[Room] stored marker corners from ${id}`);
+      }
+
       modelState = msg.state;
       modelState.ownerID = msg.state.ownerID;
       modelState.isLocked = true;
+      if (msg.state.markerID) {
+        roomMarkerID = msg.state.markerID;
+      }
       broadcast({ t: "model_state", state: modelState }, msg.clientId);
       // write debug JSON so you can inspect model state in realtime
       try {
         await fs.writeFile(
           new URL("./model_state.json", import.meta.url),
-          JSON.stringify({ modelState, lastUpdated: Date.now() }, null, 2),
+          JSON.stringify(
+            {
+              modelState,
+              roomMarker: {
+                markerID: roomMarkerID,
+                cornersWorld: roomMarkerCornersWorld,
+                cornersLocal: roomMarkerCornersLocal,
+                markerSizeMeters: roomMarkerSizeMeters,
+              },
+              lastUpdated: Date.now(),
+            },
+            null,
+            2,
+          ),
         );
       } catch (e) {
         // ignore file errors

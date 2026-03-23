@@ -1,46 +1,72 @@
 import {
   createSystem,
-  EnvironmentRaycastTarget,
+  CameraSource,
+  CameraUtils,
+  Matrix4,
   Object3D,
   Quaternion,
-  RaycastSpace,
   Vector3,
+  DistanceGrabbable,
+  MovementMode,
 } from "@iwsdk/core";
+import jsQR from "jsqr";
 
 type ModelState = {
   id: string;
+  markerID?: string | null;
   pos: [number, number, number];
   rot: [number, number, number, number];
   scale: number;
   isLocked: boolean;
   ownerID?: string | null;
   timestamp: number;
+  markerCornersWorld?: [number, number, number][];
+  markerCornersLocal?: [number, number, number][];
+  markerSizeMeters?: number;
+  modelMarkerPosLocal?: [number, number, number];
+  modelMarkerRotLocal?: [number, number, number, number];
 };
 
 type AnchorState = {
-  anchorID: string;
+  markerID: string;
   pos: [number, number, number];
   rot: [number, number, number, number];
   clientId: string;
   timestamp: number;
 };
 
+type QRScanSample = {
+  markerID: string;
+  width: number;
+  height: number;
+  centerX: number;
+  centerY: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  topLeft?: { x: number; y: number };
+  topRight?: { x: number; y: number };
+  bottomLeft?: { x: number; y: number };
+  bottomRight?: { x: number; y: number };
+};
+
+type MarkerPoseEstimate = {
+  matrix: Matrix4;
+  position: Vector3;
+  quaternion: Quaternion;
+};
+
 type ServerMessage =
   | { t: "welcome"; clientId: string }
   | { t: "model_state"; state: ModelState }
   | { t: "grab_granted"; ownerID: string }
-  | { t: "grab_released"; clientId: string }
-  | {
-      t: "anchor_created";
-      anchor: AnchorState;
-    };
+  | { t: "grab_released"; clientId: string };
 
 type ClientMessage =
-  | { t: "hello"; clientId: string }
+  | { t: "hello"; clientId: string; markerID?: string | null }
   | { t: "grab_request"; clientId: string }
   | { t: "grab_released"; clientId: string }
-  | { t: "create_anchor"; clientId: string; anchor: AnchorState }
-  | { t: "model_update"; clientId: string; state: ModelState };
+  | { t: "model_update"; clientId: string; state: ModelState }
+  | { t: "get_state"; clientId: string };
 
 export function makeNetworkSyncSystem(
   modelEntity: any,
@@ -55,6 +81,7 @@ export function makeNetworkSyncSystem(
   const releaseTimeout = opts.releaseTimeout || 500;
 
   return class NetworkSyncSystem extends createSystem({}, {}) {
+    private modelEntity: any = null;
     private socket: WebSocket | null = null;
     private debugEl: HTMLPreElement | null = null;
     private debugState: Record<string, unknown> = {};
@@ -69,20 +96,34 @@ export function makeNetworkSyncSystem(
     private lastQuaternion = new Quaternion();
     private lastScale = 1;
     private applyingRemoteState = false;
-    private anchorEstablished = false;
-    private anchorProbeEntity: any = null;
-    private anchorProbeReady = false;
+    private cameraEntity: any = null;
+    private markerID: string | null = null;
+    private lastMarkerScan = 0;
+    private markerScanInterval = 250;
+    private markerHelloSent = false;
+    private sharedModelStateReceived = false;
+    private pendingInitialPlacement: QRScanSample | null = null;
+    private initialPlacementTimer: number | null = null;
+    private initialPlacementPublished = false;
+    private currentMarkerPose: MarkerPoseEstimate | null = null;
+    private markerPhysicalSizeMeters = opts.markerPhysicalSizeMeters || 0.145;
+    private cameraHorizontalFovDeg = opts.cameraHorizontalFovDeg || 63;
+    private markerHoverMeters = opts.markerHoverMeters || 0.03;
+    private initialMarkerOffsetMeters = opts.initialMarkerOffsetMeters || 0.15;
 
     private makeFallbackClientId() {
       return `client-${Math.random().toString(36).slice(2, 10)}`;
     }
 
     init() {
+      // If the caller provided an entity (created at startup), use it so
+      // the grabbing component is already registered with the world.
+      if (modelEntity) this.modelEntity = modelEntity;
       this.lastPosition.copy(modelMesh.position);
       this.lastQuaternion.copy(modelMesh.quaternion);
       this.lastScale = modelMesh.scale.x;
 
-      this.createAnchorProbe();
+      this.createCameraProbe();
 
       this.socket = new WebSocket(serverUrl);
       this.socket.addEventListener("open", () => {
@@ -142,60 +183,618 @@ export function makeNetworkSyncSystem(
       this.socket.send(JSON.stringify(message));
     }
 
-    createAnchorProbe() {
-      if (this.anchorProbeEntity) {
+    createCameraProbe() {
+      if (this.cameraEntity) {
         return;
       }
 
-      const probeObject = new Object3D();
-      this.anchorProbeEntity = this.world.createTransformEntity(probeObject);
-      this.anchorProbeEntity.addComponent(EnvironmentRaycastTarget, {
-        space: RaycastSpace.Viewer,
-        maxDistance: 10,
+      const cameraObject = new Object3D();
+      cameraObject.visible = false;
+      this.cameraEntity = this.world.createTransformEntity(cameraObject);
+      this.cameraEntity.addComponent(CameraSource, {
+        facing: "back",
+        width: 1280,
+        height: 720,
+        frameRate: 15,
       });
-      this.anchorProbeReady = true;
     }
 
-    buildAnchorState(): AnchorState | null {
-      if (!this.anchorProbeEntity) {
+    scanMarker(now: number) {
+      if (
+        !this.cameraEntity ||
+        now - this.lastMarkerScan < this.markerScanInterval
+      ) {
+        return;
+      }
+
+      this.lastMarkerScan = now;
+      const canvas = CameraUtils.captureFrame(this.cameraEntity);
+      if (!canvas) {
+        return;
+      }
+
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
+        return;
+      }
+
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const qrCode = jsQR(imageData.data, canvas.width, canvas.height, {
+        inversionAttempts: "dontInvert",
+      });
+
+      if (!qrCode?.data) {
+        return;
+      }
+
+      const scannedMarkerID = qrCode.data.trim();
+      if (!scannedMarkerID || scannedMarkerID === this.markerID) {
+        return;
+      }
+
+      const location = qrCode.location;
+      const topWidth = Math.hypot(
+        location.topRightCorner.x - location.topLeftCorner.x,
+        location.topRightCorner.y - location.topLeftCorner.y,
+      );
+      const bottomWidth = Math.hypot(
+        location.bottomRightCorner.x - location.bottomLeftCorner.x,
+        location.bottomRightCorner.y - location.bottomLeftCorner.y,
+      );
+      const leftHeight = Math.hypot(
+        location.bottomLeftCorner.x - location.topLeftCorner.x,
+        location.bottomLeftCorner.y - location.topLeftCorner.y,
+      );
+      const rightHeight = Math.hypot(
+        location.bottomRightCorner.x - location.topRightCorner.x,
+        location.bottomRightCorner.y - location.topRightCorner.y,
+      );
+
+      this.pendingInitialPlacement = {
+        markerID: scannedMarkerID,
+        width: canvas.width,
+        height: canvas.height,
+        centerX:
+          (location.topLeftCorner.x +
+            location.topRightCorner.x +
+            location.bottomRightCorner.x +
+            location.bottomLeftCorner.x) /
+          4,
+        centerY:
+          (location.topLeftCorner.y +
+            location.topRightCorner.y +
+            location.bottomRightCorner.y +
+            location.bottomLeftCorner.y) /
+          4,
+        pixelWidth: (topWidth + bottomWidth) / 2,
+        pixelHeight: (leftHeight + rightHeight) / 2,
+        topLeft: { x: location.topLeftCorner.x, y: location.topLeftCorner.y },
+        topRight: {
+          x: location.topRightCorner.x,
+          y: location.topRightCorner.y,
+        },
+        bottomLeft: {
+          x: location.bottomLeftCorner.x,
+          y: location.bottomLeftCorner.y,
+        },
+        bottomRight: {
+          x: location.bottomRightCorner.x,
+          y: location.bottomRightCorner.y,
+        },
+      };
+
+      this.currentMarkerPose = this.solveMarkerPose(
+        this.pendingInitialPlacement,
+      );
+      if (!this.currentMarkerPose) {
+        return;
+      }
+
+      this.markerID = scannedMarkerID;
+      this.debugState = { ...this.debugState, markerID: this.markerID };
+      this.updateDebug(true);
+
+      if (this.clientId && !this.markerHelloSent) {
+        this.markerHelloSent = true;
+        this.send({
+          t: "hello",
+          clientId: this.clientId,
+          markerID: this.markerID,
+        });
+      }
+
+      if (!this.sharedModelStateReceived && !this.initialPlacementTimer) {
+        // Ask server for existing state (if any) to avoid racing and
+        // possibly overwriting an existing canonical placement.
+        try {
+          this.send({ t: "get_state", clientId: this.clientId || "pending" });
+        } catch {}
+
+        // Wait a bit longer for the server to respond before publishing.
+        this.initialPlacementTimer = window.setTimeout(() => {
+          this.initialPlacementTimer = null;
+          if (
+            this.sharedModelStateReceived ||
+            this.initialPlacementPublished ||
+            !this.pendingInitialPlacement ||
+            !this.clientId
+          ) {
+            return;
+          }
+
+          this.publishInitialPlacement(this.pendingInitialPlacement);
+        }, 1000);
+      }
+    }
+
+    publishInitialPlacement(sample: QRScanSample) {
+      const markerMeasurement = this.estimateMarkerPlacement(sample);
+      if (!markerMeasurement || !this.clientId) {
+        return;
+      }
+
+      this.initialPlacementPublished = true;
+      this.isOwner = true;
+      this.isLocked = true;
+      this.ownerID = this.clientId;
+      this.applyRemoteState(markerMeasurement);
+      this.debugState = {
+        ...this.debugState,
+        initialPlacement: markerMeasurement,
+      };
+      this.updateDebug(true);
+      this.send({
+        t: "model_update",
+        clientId: this.clientId,
+        state: this.withMarkerLocalPose(markerMeasurement),
+      });
+    }
+
+    estimateMarkerCornersWorld(
+      sample: QRScanSample,
+    ): [number, number, number][] | null {
+      const markerPose = this.solveMarkerPose(sample);
+      if (!markerPose) {
         return null;
       }
 
-      const hitTestResult = this.anchorProbeEntity.getValue(
-        EnvironmentRaycastTarget,
-        "xrHitTestResult",
-      ) as XRHitTestResult | undefined;
+      const markerSize = this.markerPhysicalSizeMeters;
+      const localCorners = [
+        new Vector3(0, 0, 0),
+        new Vector3(markerSize, 0, 0),
+        new Vector3(markerSize, markerSize, 0),
+        new Vector3(0, markerSize, 0),
+      ];
 
-      if (!hitTestResult) {
+      return localCorners.map((corner) => {
+        const worldCorner = corner.clone().applyMatrix4(markerPose.matrix);
+        return [worldCorner.x, worldCorner.y, worldCorner.z];
+      });
+    }
+
+    solveMarkerPose(sample: QRScanSample): MarkerPoseEstimate | null {
+      const topLeft = sample.topLeft;
+      const topRight = sample.topRight;
+      const bottomRight = sample.bottomRight;
+      const bottomLeft = sample.bottomLeft;
+
+      if (!topLeft || !topRight || !bottomRight || !bottomLeft) {
         return null;
       }
 
-      const referenceSpace = this.world.renderer.xr.getReferenceSpace();
-      if (!referenceSpace) {
+      const fieldOfViewRad = (this.cameraHorizontalFovDeg * Math.PI) / 180;
+      const focalLengthPx = sample.width / (2 * Math.tan(fieldOfViewRad / 2));
+      const cx = sample.width / 2;
+      const cy = sample.height / 2;
+      const markerSize = this.markerPhysicalSizeMeters;
+
+      const homography = this.solveHomography([
+        { X: 0, Y: 0, u: topLeft.x, v: topLeft.y },
+        { X: markerSize, Y: 0, u: topRight.x, v: topRight.y },
+        { X: markerSize, Y: markerSize, u: bottomRight.x, v: bottomRight.y },
+        { X: 0, Y: markerSize, u: bottomLeft.x, v: bottomLeft.y },
+      ]);
+
+      if (!homography) {
         return null;
       }
 
-      const pose = hitTestResult.getPose(referenceSpace);
-      if (!pose) {
-        return null;
-      }
+      const h00 = homography[0];
+      const h01 = homography[1];
+      const h02 = homography[2];
+      const h10 = homography[3];
+      const h11 = homography[4];
+      const h12 = homography[5];
+      const h20 = homography[6];
+      const h21 = homography[7];
+      const h22 = homography[8];
 
-      const anchorID = `anchor-${this.clientId || "pending"}`;
+      const invFx = 1 / focalLengthPx;
+      const invFy = 1 / focalLengthPx;
+      const kInvH00 = invFx * h00 + -cx * invFx * h20;
+      const kInvH01 = invFx * h01 + -cx * invFx * h21;
+      const kInvH02 = invFx * h02 + -cx * invFx * h22;
+      const kInvH10 = invFy * h10 + -cy * invFy * h20;
+      const kInvH11 = invFy * h11 + -cy * invFy * h21;
+      const kInvH12 = invFy * h12 + -cy * invFy * h22;
+      const kInvH20 = h20;
+      const kInvH21 = h21;
+      const kInvH22 = h22;
+
+      const norm1 = Math.hypot(kInvH00, kInvH10, kInvH20);
+      const norm2 = Math.hypot(kInvH01, kInvH11, kInvH21);
+      const scale = (norm1 + norm2) / 2 || 1;
+
+      let r1x = kInvH00 / scale;
+      let r1y = kInvH10 / scale;
+      let r1z = kInvH20 / scale;
+      let r2x = kInvH01 / scale;
+      let r2y = kInvH11 / scale;
+      let r2z = kInvH21 / scale;
+      const tx = kInvH02 / scale;
+      const ty = kInvH12 / scale;
+      const tz = kInvH22 / scale;
+
+      const r1Length = Math.hypot(r1x, r1y, r1z) || 1;
+      r1x /= r1Length;
+      r1y /= r1Length;
+      r1z /= r1Length;
+
+      const dot12 = r1x * r2x + r1y * r2y + r1z * r2z;
+      r2x -= r1x * dot12;
+      r2y -= r1y * dot12;
+      r2z -= r1z * dot12;
+      const r2Length = Math.hypot(r2x, r2y, r2z) || 1;
+      r2x /= r2Length;
+      r2y /= r2Length;
+      r2z /= r2Length;
+
+      const r3x = r1y * r2z - r1z * r2y;
+      const r3y = r1z * r2x - r1x * r2z;
+      const r3z = r1x * r2y - r1y * r2x;
+
+      const markerMatrixCamera = new Matrix4().set(
+        r1x,
+        r2x,
+        r3x,
+        tx,
+        r1y,
+        r2y,
+        r3y,
+        ty,
+        r1z,
+        r2z,
+        r3z,
+        tz,
+        0,
+        0,
+        0,
+        1,
+      );
+
+      const markerMatrixThree = new Matrix4().set(
+        markerMatrixCamera.elements[0],
+        markerMatrixCamera.elements[4],
+        markerMatrixCamera.elements[8],
+        markerMatrixCamera.elements[12],
+        -markerMatrixCamera.elements[1],
+        -markerMatrixCamera.elements[5],
+        -markerMatrixCamera.elements[9],
+        -markerMatrixCamera.elements[13],
+        -markerMatrixCamera.elements[2],
+        -markerMatrixCamera.elements[6],
+        -markerMatrixCamera.elements[10],
+        -markerMatrixCamera.elements[14],
+        0,
+        0,
+        0,
+        1,
+      );
+
+      this.camera.updateMatrixWorld?.(true);
+      const markerWorldMatrix = new Matrix4().multiplyMatrices(
+        this.camera.matrixWorld,
+        markerMatrixThree,
+      );
+
+      const position = new Vector3().setFromMatrixPosition(markerWorldMatrix);
+      const quaternion = new Quaternion().setFromRotationMatrix(
+        markerWorldMatrix,
+      );
+
       return {
-        anchorID,
-        pos: [
-          pose.transform.position.x,
-          pose.transform.position.y,
-          pose.transform.position.z,
+        matrix: markerWorldMatrix,
+        position,
+        quaternion,
+      };
+    }
+
+    solveHomography(
+      correspondences: Array<{ X: number; Y: number; u: number; v: number }>,
+    ): number[] | null {
+      const rows = [
+        [
+          correspondences[0].X,
+          correspondences[0].Y,
+          1,
+          0,
+          0,
+          0,
+          -correspondences[0].u * correspondences[0].X,
+          -correspondences[0].u * correspondences[0].Y,
         ],
+        [
+          0,
+          0,
+          0,
+          correspondences[0].X,
+          correspondences[0].Y,
+          1,
+          -correspondences[0].v * correspondences[0].X,
+          -correspondences[0].v * correspondences[0].Y,
+        ],
+        [
+          correspondences[1].X,
+          correspondences[1].Y,
+          1,
+          0,
+          0,
+          0,
+          -correspondences[1].u * correspondences[1].X,
+          -correspondences[1].u * correspondences[1].Y,
+        ],
+        [
+          0,
+          0,
+          0,
+          correspondences[1].X,
+          correspondences[1].Y,
+          1,
+          -correspondences[1].v * correspondences[1].X,
+          -correspondences[1].v * correspondences[1].Y,
+        ],
+        [
+          correspondences[2].X,
+          correspondences[2].Y,
+          1,
+          0,
+          0,
+          0,
+          -correspondences[2].u * correspondences[2].X,
+          -correspondences[2].u * correspondences[2].Y,
+        ],
+        [
+          0,
+          0,
+          0,
+          correspondences[2].X,
+          correspondences[2].Y,
+          1,
+          -correspondences[2].v * correspondences[2].X,
+          -correspondences[2].v * correspondences[2].Y,
+        ],
+        [
+          correspondences[3].X,
+          correspondences[3].Y,
+          1,
+          0,
+          0,
+          0,
+          -correspondences[3].u * correspondences[3].X,
+          -correspondences[3].u * correspondences[3].Y,
+        ],
+        [
+          0,
+          0,
+          0,
+          correspondences[3].X,
+          correspondences[3].Y,
+          1,
+          -correspondences[3].v * correspondences[3].X,
+          -correspondences[3].v * correspondences[3].Y,
+        ],
+      ];
+      const vector = [
+        correspondences[0].u,
+        correspondences[0].v,
+        correspondences[1].u,
+        correspondences[1].v,
+        correspondences[2].u,
+        correspondences[2].v,
+        correspondences[3].u,
+        correspondences[3].v,
+      ];
+
+      const solution = this.solveGaussian(rows, vector);
+      if (!solution) {
+        return null;
+      }
+
+      return [
+        solution[0],
+        solution[1],
+        solution[2],
+        solution[3],
+        solution[4],
+        solution[5],
+        solution[6],
+        solution[7],
+        1,
+      ];
+    }
+
+    solveGaussian(matrix: number[][], vector: number[]): number[] | null {
+      const size = vector.length;
+      const augmented = matrix.map((row, index) => [...row, vector[index]]);
+
+      for (let pivot = 0; pivot < size; pivot += 1) {
+        let bestRow = pivot;
+        for (let row = pivot + 1; row < size; row += 1) {
+          if (
+            Math.abs(augmented[row][pivot]) >
+            Math.abs(augmented[bestRow][pivot])
+          ) {
+            bestRow = row;
+          }
+        }
+
+        if (Math.abs(augmented[bestRow][pivot]) < 1e-8) {
+          return null;
+        }
+
+        if (bestRow !== pivot) {
+          const swap = augmented[pivot];
+          augmented[pivot] = augmented[bestRow];
+          augmented[bestRow] = swap;
+        }
+
+        const pivotValue = augmented[pivot][pivot];
+        for (let column = pivot; column <= size; column += 1) {
+          augmented[pivot][column] /= pivotValue;
+        }
+
+        for (let row = 0; row < size; row += 1) {
+          if (row === pivot) continue;
+          const factor = augmented[row][pivot];
+          if (factor === 0) continue;
+          for (let column = pivot; column <= size; column += 1) {
+            augmented[row][column] -= factor * augmented[pivot][column];
+          }
+        }
+      }
+
+      return augmented.map((row) => row[size]);
+    }
+
+    withMarkerLocalPose(state: ModelState): ModelState {
+      const markerPose = this.currentMarkerPose;
+      if (!markerPose) {
+        return state;
+      }
+
+      const worldMatrix = new Matrix4().compose(
+        new Vector3(state.pos[0], state.pos[1], state.pos[2]),
+        new Quaternion(state.rot[0], state.rot[1], state.rot[2], state.rot[3]),
+        new Vector3(state.scale, state.scale, state.scale),
+      );
+      const markerInverse = new Matrix4().copy(markerPose.matrix).invert();
+      const localMatrix = new Matrix4().multiplyMatrices(
+        markerInverse,
+        worldMatrix,
+      );
+
+      const localPosition = new Vector3();
+      const localQuaternion = new Quaternion();
+      const localScale = new Vector3();
+      localMatrix.decompose(localPosition, localQuaternion, localScale);
+
+      return {
+        ...state,
+        modelMarkerPosLocal: [
+          localPosition.x,
+          localPosition.y,
+          localPosition.z,
+        ],
+        modelMarkerRotLocal: [
+          localQuaternion.x,
+          localQuaternion.y,
+          localQuaternion.z,
+          localQuaternion.w,
+        ],
+      };
+    }
+
+    resolveStateForLocalMarker(state: ModelState): ModelState {
+      const markerPose = this.currentMarkerPose;
+      if (!state.modelMarkerPosLocal || !markerPose) {
+        return state;
+      }
+
+      const localPosition = new Vector3(
+        state.modelMarkerPosLocal[0],
+        state.modelMarkerPosLocal[1],
+        state.modelMarkerPosLocal[2],
+      );
+      const localQuaternion = state.modelMarkerRotLocal
+        ? new Quaternion(
+            state.modelMarkerRotLocal[0],
+            state.modelMarkerRotLocal[1],
+            state.modelMarkerRotLocal[2],
+            state.modelMarkerRotLocal[3],
+          )
+        : new Quaternion();
+      const localScale = new Vector3(state.scale, state.scale, state.scale);
+      const localMatrix = new Matrix4().compose(
+        localPosition,
+        localQuaternion,
+        localScale,
+      );
+      const worldMatrix = new Matrix4().multiplyMatrices(
+        markerPose.matrix,
+        localMatrix,
+      );
+
+      const worldPosition = new Vector3();
+      const worldQuaternion = new Quaternion();
+      const worldScale = new Vector3();
+      worldMatrix.decompose(worldPosition, worldQuaternion, worldScale);
+
+      return {
+        ...state,
+        pos: [worldPosition.x, worldPosition.y, worldPosition.z],
         rot: [
-          pose.transform.orientation.x,
-          pose.transform.orientation.y,
-          pose.transform.orientation.z,
-          pose.transform.orientation.w,
+          worldQuaternion.x,
+          worldQuaternion.y,
+          worldQuaternion.z,
+          worldQuaternion.w,
         ],
-        clientId: this.clientId || "pending",
+        scale: worldScale.x,
+      };
+    }
+
+    estimateMarkerPlacement(sample: QRScanSample): ModelState | null {
+      const markerPose = this.currentMarkerPose || this.solveMarkerPose(sample);
+      if (!markerPose) {
+        return null;
+      }
+
+      const worldPosition = new Vector3(
+        this.initialMarkerOffsetMeters,
+        0,
+        0,
+      ).applyMatrix4(markerPose.matrix);
+      const worldQuaternion = markerPose.quaternion.clone();
+
+      const cornerWorlds = this.estimateMarkerCornersWorld(sample);
+      if (!cornerWorlds) {
+        return null;
+      }
+
+      const markerSize = this.markerPhysicalSizeMeters;
+      const markerCornersLocal: [number, number, number][] = [
+        [0, 0, 0],
+        [markerSize, 0, 0],
+        [markerSize, markerSize, 0],
+        [0, markerSize, 0],
+      ];
+
+      return {
+        id: "model-1",
+        markerID: sample.markerID,
+        pos: [worldPosition.x, worldPosition.y, worldPosition.z],
+        rot: [
+          worldQuaternion.x,
+          worldQuaternion.y,
+          worldQuaternion.z,
+          worldQuaternion.w,
+        ],
+        scale: modelMesh.scale.x,
+        isLocked: true,
+        ownerID: this.clientId,
         timestamp: Date.now(),
+        markerCornersWorld: cornerWorlds,
+        markerCornersLocal: markerCornersLocal,
+        markerSizeMeters: markerSize,
       };
     }
 
@@ -208,6 +807,14 @@ export function makeNetworkSyncSystem(
         console.log("[Network] joined as", this.clientId);
         this.debugState = { ...this.debugState, joinedAs: this.clientId };
         this.updateDebug(true);
+        if (this.markerID) {
+          this.markerHelloSent = true;
+          this.send({
+            t: "hello",
+            clientId: this.clientId,
+            markerID: this.markerID,
+          });
+        }
         return;
       }
 
@@ -216,7 +823,19 @@ export function makeNetworkSyncSystem(
       }
 
       if (message.t === "model_state") {
-        const state = message.state;
+        const state = this.resolveStateForLocalMarker(message.state);
+        this.sharedModelStateReceived = true;
+        if (this.initialPlacementTimer) {
+          window.clearTimeout(this.initialPlacementTimer);
+          this.initialPlacementTimer = null;
+        }
+        if (
+          state.markerID &&
+          this.markerID &&
+          state.markerID !== this.markerID
+        ) {
+          return;
+        }
         if (state.ownerID === this.clientId && this.isOwner) {
           return;
         }
@@ -251,48 +870,23 @@ export function makeNetworkSyncSystem(
         this.updateDebug(true);
         return;
       }
-
-      if (message.t === "anchor_created") {
-        this.anchorEstablished = true;
-        this.applyAnchorState(message.anchor);
-        this.debugState = { ...this.debugState, anchor: message.anchor };
-        this.updateDebug(true);
-      }
-    }
-
-    applyAnchorState(anchor: AnchorState) {
-      modelMesh.position.set(anchor.pos[0], anchor.pos[1], anchor.pos[2]);
-      modelMesh.quaternion.set(
-        anchor.rot[0],
-        anchor.rot[1],
-        anchor.rot[2],
-        anchor.rot[3],
-      );
-      this.lastPosition.copy(modelMesh.position);
-      this.lastQuaternion.copy(modelMesh.quaternion);
-      this.lastScale = modelMesh.scale.x;
-      this.anchorEstablished = true;
-    }
-
-    tryCreateAnchor(now: number) {
-      if (!this.clientId || this.anchorEstablished || !this.anchorProbeReady) {
-        return;
-      }
-
-      const anchor = this.buildAnchorState();
-      if (!anchor) {
-        return;
-      }
-
-      this.anchorEstablished = true;
-      this.applyAnchorState(anchor);
-      this.send({ t: "create_anchor", clientId: this.clientId, anchor });
-      this.debugState = { ...this.debugState, anchorCreatedAt: now, anchor };
-      this.updateDebug(true);
     }
 
     applyRemoteState(state: ModelState) {
       this.applyingRemoteState = true;
+      // Ensure the mesh is visible and attached to the world as an entity
+      if (!modelMesh.visible) modelMesh.visible = true;
+      if (!this.modelEntity) {
+        this.modelEntity = this.world.createTransformEntity(modelMesh);
+        try {
+          this.modelEntity.addComponent(DistanceGrabbable, {
+            movementMode: MovementMode.MoveFromTarget,
+          });
+        } catch {
+          // ignore if component registration fails in non-XR contexts
+        }
+      }
+
       modelMesh.position.set(state.pos[0], state.pos[1], state.pos[2]);
       modelMesh.quaternion.set(
         state.rot[0],
@@ -346,9 +940,9 @@ export function makeNetworkSyncSystem(
         return;
       }
 
-      this.tryCreateAnchor(performance.now());
-
       const now = performance.now();
+      this.scanMarker(now);
+
       const moved =
         !modelMesh.position.equals(this.lastPosition) ||
         !modelMesh.quaternion.equals(this.lastQuaternion) ||
@@ -370,6 +964,7 @@ export function makeNetworkSyncSystem(
       if (this.isOwner && now - this.lastSend >= sendInterval) {
         const state: ModelState = {
           id: "model-1",
+          markerID: this.markerID,
           pos: [
             modelMesh.position.x,
             modelMesh.position.y,
@@ -387,7 +982,11 @@ export function makeNetworkSyncSystem(
           timestamp: Date.now(),
         };
 
-        this.send({ t: "model_update", clientId: this.clientId, state });
+        this.send({
+          t: "model_update",
+          clientId: this.clientId,
+          state: this.withMarkerLocalPose(state),
+        });
         this.lastSend = now;
       }
 
@@ -403,7 +1002,7 @@ export function makeNetworkSyncSystem(
       this.lastScale = modelMesh.scale.x;
       this.debugState = {
         ...this.debugState,
-        anchorEstablished: this.anchorEstablished,
+        markerID: this.markerID,
       };
       this.updateDebug();
     }
