@@ -19,7 +19,17 @@ export default defineConfig({
 
     compileUIKit({ sourceDir: "ui", outputDir: "public/ui", verbose: true }),
   ],
-  server: { host: "0.0.0.0", port: 8081, open: true },
+  server: {
+    host: "0.0.0.0",
+    port: 8081,
+    open: true,
+    proxy: {
+      "/room": {
+        target: "ws://localhost:8787",
+        ws: true,
+      },
+    },
+  },
   build: {
     outDir: "dist",
     sourcemap: process.env.NODE_ENV !== "production",

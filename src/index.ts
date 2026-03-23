@@ -9,6 +9,7 @@ import {
   Transform,
 } from "@iwsdk/core";
 import { makeModelUniformScaleSystem } from "./uniformScaleModel";
+import { makeNetworkSyncSystem } from "./sync/networkSystem";
 
 const assets: AssetManifest = {
   model: {
@@ -53,6 +54,7 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
       movementMode: MovementMode.MoveFromTarget,
     });
 
-  // Register the system so its update() runs each frame
+  // Register the uniform scale helper and the networking sync system
   world.registerSystem(makeModelUniformScaleSystem(modelMesh));
+  world.registerSystem(makeNetworkSyncSystem(entity, modelMesh));
 });
