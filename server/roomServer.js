@@ -41,9 +41,7 @@ wss.on("connection", (ws) => {
       ws.send(
         JSON.stringify({
           t: "anchor_created",
-          anchorID: anchor.id,
-          pos: anchor.pos,
-          rot: anchor.rot,
+          anchor,
         }),
       );
     } catch (e) {}
@@ -70,24 +68,25 @@ wss.on("connection", (ws) => {
         ws.send(
           JSON.stringify({
             t: "anchor_created",
-            anchorID: anchor.id,
-            pos: anchor.pos,
-            rot: anchor.rot,
+            anchor,
           }),
         );
     } else if (msg.t === "create_anchor") {
-      anchor = {
-        id: msg.anchorID,
-        pos: msg.pos,
-        rot: msg.rot,
-        clientId: msg.clientId,
-      };
-      broadcast({
-        t: "anchor_created",
-        anchorID: anchor.id,
-        pos: anchor.pos,
-        rot: anchor.rot,
-      });
+      if (!anchor) {
+        anchor = {
+          anchorID:
+            msg.anchor?.anchorID ||
+            `anchor-${(msg.clientId || id).slice(0, 8)}`,
+          pos: msg.anchor.pos,
+          rot: msg.anchor.rot,
+          clientId: msg.clientId || id,
+          timestamp: msg.anchor.timestamp || Date.now(),
+        };
+        broadcast({ t: "anchor_created", anchor });
+        console.log(`[Room] anchor created by ${anchor.clientId}`);
+      } else {
+        ws.send(JSON.stringify({ t: "anchor_created", anchor }));
+      }
     } else if (msg.t === "grab_request") {
       console.log(`[Room] grab_request from ${id}`);
       // grant immediately for simplicity if no owner

@@ -1,4 +1,11 @@
-import { createSystem, Quaternion, Vector3 } from "@iwsdk/core";
+import {
+  createSystem,
+  EnvironmentRaycastTarget,
+  Object3D,
+  Quaternion,
+  RaycastSpace,
+  Vector3,
+} from "@iwsdk/core";
 
 type ModelState = {
   id: string;
@@ -10,6 +17,14 @@ type ModelState = {
   timestamp: number;
 };
 
+type AnchorState = {
+  anchorID: string;
+  pos: [number, number, number];
+  rot: [number, number, number, number];
+  clientId: string;
+  timestamp: number;
+};
+
 type ServerMessage =
   | { t: "welcome"; clientId: string }
   | { t: "model_state"; state: ModelState }
@@ -17,15 +32,14 @@ type ServerMessage =
   | { t: "grab_released"; clientId: string }
   | {
       t: "anchor_created";
-      anchorID: string;
-      pos: [number, number, number];
-      rot: [number, number, number, number];
+      anchor: AnchorState;
     };
 
 type ClientMessage =
   | { t: "hello"; clientId: string }
   | { t: "grab_request"; clientId: string }
   | { t: "grab_released"; clientId: string }
+  | { t: "create_anchor"; clientId: string; anchor: AnchorState }
   | { t: "model_update"; clientId: string; state: ModelState };
 
 export function makeNetworkSyncSystem(
@@ -55,6 +69,9 @@ export function makeNetworkSyncSystem(
     private lastQuaternion = new Quaternion();
     private lastScale = 1;
     private applyingRemoteState = false;
+    private anchorEstablished = false;
+    private anchorProbeEntity: any = null;
+    private anchorProbeReady = false;
 
     private makeFallbackClientId() {
       return `client-${Math.random().toString(36).slice(2, 10)}`;
@@ -64,6 +81,8 @@ export function makeNetworkSyncSystem(
       this.lastPosition.copy(modelMesh.position);
       this.lastQuaternion.copy(modelMesh.quaternion);
       this.lastScale = modelMesh.scale.x;
+
+      this.createAnchorProbe();
 
       this.socket = new WebSocket(serverUrl);
       this.socket.addEventListener("open", () => {
@@ -123,6 +142,63 @@ export function makeNetworkSyncSystem(
       this.socket.send(JSON.stringify(message));
     }
 
+    createAnchorProbe() {
+      if (this.anchorProbeEntity) {
+        return;
+      }
+
+      const probeObject = new Object3D();
+      this.anchorProbeEntity = this.world.createTransformEntity(probeObject);
+      this.anchorProbeEntity.addComponent(EnvironmentRaycastTarget, {
+        space: RaycastSpace.Viewer,
+        maxDistance: 10,
+      });
+      this.anchorProbeReady = true;
+    }
+
+    buildAnchorState(): AnchorState | null {
+      if (!this.anchorProbeEntity) {
+        return null;
+      }
+
+      const hitTestResult = this.anchorProbeEntity.getValue(
+        EnvironmentRaycastTarget,
+        "xrHitTestResult",
+      ) as XRHitTestResult | undefined;
+
+      if (!hitTestResult) {
+        return null;
+      }
+
+      const referenceSpace = this.world.renderer.xr.getReferenceSpace();
+      if (!referenceSpace) {
+        return null;
+      }
+
+      const pose = hitTestResult.getPose(referenceSpace);
+      if (!pose) {
+        return null;
+      }
+
+      const anchorID = `anchor-${this.clientId || "pending"}`;
+      return {
+        anchorID,
+        pos: [
+          pose.transform.position.x,
+          pose.transform.position.y,
+          pose.transform.position.z,
+        ],
+        rot: [
+          pose.transform.orientation.x,
+          pose.transform.orientation.y,
+          pose.transform.orientation.z,
+          pose.transform.orientation.w,
+        ],
+        clientId: this.clientId || "pending",
+        timestamp: Date.now(),
+      };
+    }
+
     handleMessage(message: ServerMessage) {
       if (message.t === "welcome") {
         this.clientId =
@@ -177,9 +253,42 @@ export function makeNetworkSyncSystem(
       }
 
       if (message.t === "anchor_created") {
-        this.debugState = { ...this.debugState, anchor: message.anchorID };
+        this.anchorEstablished = true;
+        this.applyAnchorState(message.anchor);
+        this.debugState = { ...this.debugState, anchor: message.anchor };
         this.updateDebug(true);
       }
+    }
+
+    applyAnchorState(anchor: AnchorState) {
+      modelMesh.position.set(anchor.pos[0], anchor.pos[1], anchor.pos[2]);
+      modelMesh.quaternion.set(
+        anchor.rot[0],
+        anchor.rot[1],
+        anchor.rot[2],
+        anchor.rot[3],
+      );
+      this.lastPosition.copy(modelMesh.position);
+      this.lastQuaternion.copy(modelMesh.quaternion);
+      this.lastScale = modelMesh.scale.x;
+      this.anchorEstablished = true;
+    }
+
+    tryCreateAnchor(now: number) {
+      if (!this.clientId || this.anchorEstablished || !this.anchorProbeReady) {
+        return;
+      }
+
+      const anchor = this.buildAnchorState();
+      if (!anchor) {
+        return;
+      }
+
+      this.anchorEstablished = true;
+      this.applyAnchorState(anchor);
+      this.send({ t: "create_anchor", clientId: this.clientId, anchor });
+      this.debugState = { ...this.debugState, anchorCreatedAt: now, anchor };
+      this.updateDebug(true);
     }
 
     applyRemoteState(state: ModelState) {
@@ -237,6 +346,8 @@ export function makeNetworkSyncSystem(
         return;
       }
 
+      this.tryCreateAnchor(performance.now());
+
       const now = performance.now();
       const moved =
         !modelMesh.position.equals(this.lastPosition) ||
@@ -290,6 +401,10 @@ export function makeNetworkSyncSystem(
       this.lastPosition.copy(modelMesh.position);
       this.lastQuaternion.copy(modelMesh.quaternion);
       this.lastScale = modelMesh.scale.x;
+      this.debugState = {
+        ...this.debugState,
+        anchorEstablished: this.anchorEstablished,
+      };
       this.updateDebug();
     }
 
