@@ -24,10 +24,26 @@ function broadcast(msg, except = null) {
   }
 }
 
+function formatTime(date = new Date()) {
+  return date.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+}
+
+function logActiveUsers() {
+  const ids = Array.from(clients.keys());
+  const time = formatTime();
+  console.log(`[${time}] active users ${ids.length}: [${ids.join(", ")}]`);
+}
+
 wss.on("connection", (ws) => {
   const id = `user-${randomUUID().slice(0, 8)}`;
   clients.set(id, ws);
-  console.log(`[Room] user joined ${id}`);
+  // membership changed -> compact summary log
+  logActiveUsers();
 
   try {
     ws.send(JSON.stringify({ t: "welcome", clientId: id }));
@@ -41,12 +57,11 @@ wss.on("connection", (ws) => {
       console.warn("invalid json");
       return;
     }
-    console.log(
-      `[Room] message ${msg.t || "unknown"} from ${msg.clientId || id}`,
-    );
+    // Intentionally not logging every incoming message here to reduce noise.
+    // Keep specific event logs only where useful (e.g. model updates).
 
     if (msg.t === "hello") {
-      console.log(`[Room] hello from ${id}`);
+      // don't log hello messages to avoid chatter
       if (msg.markerID) {
         if (!roomMarkerID) {
           roomMarkerID = msg.markerID;
@@ -63,20 +78,17 @@ wss.on("connection", (ws) => {
       )
         ws.send(JSON.stringify({ t: "model_state", state: modelState }));
     } else if (msg.t === "grab_request") {
-      console.log(`[Room] grab_request from ${id}`);
+      // don't log grab_request to avoid chatter; behavior unchanged
       // grant immediately for simplicity if no owner
       if (!currentOwner) {
         currentOwner = id;
         broadcast({ t: "grab_granted", ownerID: currentOwner });
-        console.log(`[Room] grab granted to ${currentOwner}`);
       } else {
         // deny by ignoring; could implement queue
-        console.log(
-          `[Room] grab_request denied for ${id} (owner ${currentOwner})`,
-        );
+        // denied - intentionally no noisy log
       }
     } else if (msg.t === "grab_released") {
-      console.log(`[Room] grab_released from ${id}`);
+      // don't log grab_released events
       if (currentOwner === id) {
         currentOwner = null;
         broadcast({ t: "grab_released", clientId: id });
@@ -137,8 +149,9 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log(`[Room] user left ${id}`);
     clients.delete(id);
+    // membership changed -> compact summary log
+    logActiveUsers();
     if (currentOwner === id) {
       currentOwner = null;
       broadcast({ t: "grab_released", clientId: id });

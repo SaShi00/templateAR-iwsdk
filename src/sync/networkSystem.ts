@@ -811,7 +811,6 @@ export function makeNetworkSyncSystem(
           typeof message.clientId === "string" && message.clientId.trim()
             ? message.clientId
             : this.makeFallbackClientId();
-        console.log("[Network] joined as", this.clientId);
         this.debugState = { ...this.debugState, joinedAs: this.clientId };
         this.updateDebug(true);
         if (this.markerID) {
@@ -859,7 +858,6 @@ export function makeNetworkSyncSystem(
         this.ownerID = message.ownerID;
         this.isOwner = message.ownerID === this.clientId;
         this.isLocked = true;
-        console.log(`[Network] grab granted to ${message.ownerID}`);
         this.debugState = { ...this.debugState, grabGranted: message.ownerID };
         this.updateDebug(true);
         return;
@@ -869,7 +867,6 @@ export function makeNetworkSyncSystem(
         this.isOwner = false;
         this.isLocked = false;
         this.ownerID = null;
-        console.log(`[Network] grab released by ${message.clientId}`);
         this.debugState = {
           ...this.debugState,
           grabReleased: message.clientId,
@@ -925,31 +922,8 @@ export function makeNetworkSyncSystem(
       if (!force && now - this.lastDebugUpdate < 200) return;
       this.lastDebugUpdate = now;
 
-      this.debugEl.textContent = JSON.stringify(
-        {
-          clientId: this.clientId,
-          ownerID: this.ownerID,
-          isOwner: this.isOwner,
-          isLocked: this.isLocked,
-          mesh: {
-            position: [
-              modelMesh.position.x,
-              modelMesh.position.y,
-              modelMesh.position.z,
-            ],
-            rotation: [
-              modelMesh.quaternion.x,
-              modelMesh.quaternion.y,
-              modelMesh.quaternion.z,
-              modelMesh.quaternion.w,
-            ],
-            scale: modelMesh.scale.x,
-          },
-          debugState: this.debugState,
-        },
-        null,
-        2,
-      );
+      // Show only the connected user id in the overlay (labelled "User id")
+      this.debugEl.textContent = `User id: ${this.clientId || "-"}`;
     }
 
     update() {
