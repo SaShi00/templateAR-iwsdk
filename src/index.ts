@@ -47,7 +47,7 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
 
   const { scene: modelMesh } = AssetManager.getGLTF("model")!;
   modelMesh.position.set(0, 1, -2);
-  modelMesh.scale.setScalar(0.3);
+  modelMesh.scale.setScalar(0.2);
   // Hide the model until a QR marker is scanned and placement is known
   modelMesh.visible = false;
 

@@ -110,6 +110,13 @@ export function makeNetworkSyncSystem(
     private cameraHorizontalFovDeg = opts.cameraHorizontalFovDeg || 63;
     private markerHoverMeters = opts.markerHoverMeters || 0.03;
     private initialMarkerOffsetMeters = opts.initialMarkerOffsetMeters || 0.15;
+    // Jitter suppression thresholds
+    private positionEpsilon = opts.positionEpsilon || 0.01; // meters
+    private rotationEpsilon = opts.rotationEpsilon || 0.02; // radians (~1.1 deg)
+    private scaleEpsilon = opts.scaleEpsilon || 0.005; // relative
+    private enableSmoothing =
+      opts.enableSmoothing !== undefined ? opts.enableSmoothing : true;
+    private smoothingFactor = opts.smoothingFactor || 0.25;
 
     private makeFallbackClientId() {
       return `client-${Math.random().toString(36).slice(2, 10)}`;
@@ -337,7 +344,7 @@ export function makeNetworkSyncSystem(
       this.isOwner = true;
       this.isLocked = true;
       this.ownerID = this.clientId;
-      this.applyRemoteState(markerMeasurement);
+      this.applyRemoteState(markerMeasurement, true);
       this.debugState = {
         ...this.debugState,
         initialPlacement: markerMeasurement,
@@ -842,7 +849,7 @@ export function makeNetworkSyncSystem(
 
         this.ownerID = state.ownerID || null;
         this.isLocked = Boolean(state.isLocked);
-        this.applyRemoteState(state);
+        this.applyRemoteState(state, !modelMesh.visible);
         this.debugState = { ...this.debugState, incoming: state };
         this.updateDebug();
         return;
@@ -872,7 +879,7 @@ export function makeNetworkSyncSystem(
       }
     }
 
-    applyRemoteState(state: ModelState) {
+    applyRemoteState(state: ModelState, preserveRotation = false) {
       this.applyingRemoteState = true;
       // Ensure the mesh is visible and attached to the world as an entity
       if (!modelMesh.visible) modelMesh.visible = true;
@@ -887,14 +894,25 @@ export function makeNetworkSyncSystem(
         }
       }
 
-      modelMesh.position.set(state.pos[0], state.pos[1], state.pos[2]);
-      modelMesh.quaternion.set(
-        state.rot[0],
-        state.rot[1],
-        state.rot[2],
-        state.rot[3],
+      const incomingPosition = new Vector3(
+        state.pos[0],
+        state.pos[1],
+        state.pos[2],
       );
+      const incomingQuaternion = preserveRotation
+        ? modelMesh.quaternion.clone()
+        : new Quaternion(
+            state.rot[0],
+            state.rot[1],
+            state.rot[2],
+            state.rot[3],
+          );
+
+      // Apply position and (conditionally) rotation
+      modelMesh.position.copy(incomingPosition);
+      modelMesh.quaternion.copy(incomingQuaternion);
       modelMesh.scale.setScalar(state.scale);
+
       this.lastPosition.copy(modelMesh.position);
       this.lastQuaternion.copy(modelMesh.quaternion);
       this.lastScale = modelMesh.scale.x;
