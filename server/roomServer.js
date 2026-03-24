@@ -12,6 +12,7 @@ console.log(`room server listening on ws://localhost:${PORT}`);
 const clients = new Map();
 let modelState = null;
 let currentOwner = null;
+let adminId = null;
 let roomMarkerID = null;
 let roomMarkerCornersWorld = null;
 let roomMarkerCornersLocal = null;
@@ -45,8 +46,16 @@ wss.on("connection", (ws) => {
   // membership changed -> compact summary log
   logActiveUsers();
 
+  // If no admin yet, make the first connected client the admin
+  if (!adminId) {
+    adminId = id;
+    // announce admin to anyone already connected
+    console.log(`[Room] admin assigned to ${adminId}`);
+    broadcast({ t: "admin_changed", adminId });
+  }
+
   try {
-    ws.send(JSON.stringify({ t: "welcome", clientId: id }));
+    ws.send(JSON.stringify({ t: "welcome", clientId: id, adminId }));
   } catch (e) {}
 
   ws.on("message", async (data) => {
@@ -76,7 +85,9 @@ wss.on("connection", (ws) => {
         msg.markerID &&
         (!roomMarkerID || roomMarkerID === msg.markerID)
       )
-        ws.send(JSON.stringify({ t: "model_state", state: modelState }));
+        ws.send(
+          JSON.stringify({ t: "model_state", state: modelState, adminId }),
+        );
     } else if (msg.t === "grab_request") {
       // don't log grab_request to avoid chatter; behavior unchanged
       // grant immediately for simplicity if no owner
@@ -115,7 +126,7 @@ wss.on("connection", (ws) => {
       if (msg.state.markerID) {
         roomMarkerID = msg.state.markerID;
       }
-      broadcast({ t: "model_state", state: modelState }, msg.clientId);
+      broadcast({ t: "model_state", state: modelState, adminId }, msg.clientId);
       // write debug JSON so you can inspect model state in realtime
       try {
         await fs.writeFile(
@@ -142,7 +153,9 @@ wss.on("connection", (ws) => {
       // client explicitly requests current model state
       if (modelState) {
         try {
-          ws.send(JSON.stringify({ t: "model_state", state: modelState }));
+          ws.send(
+            JSON.stringify({ t: "model_state", state: modelState, adminId }),
+          );
         } catch (e) {}
       }
     }
@@ -155,6 +168,12 @@ wss.on("connection", (ws) => {
     if (currentOwner === id) {
       currentOwner = null;
       broadcast({ t: "grab_released", clientId: id });
+    }
+    // If admin disconnected, promote next connected client (if any)
+    if (adminId === id) {
+      const next = clients.keys().next();
+      adminId = next.done ? null : next.value;
+      broadcast({ t: "admin_changed", adminId });
     }
   });
 });

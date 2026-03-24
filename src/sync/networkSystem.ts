@@ -56,10 +56,11 @@ type MarkerPoseEstimate = {
 };
 
 type ServerMessage =
-  | { t: "welcome"; clientId: string }
+  | { t: "welcome"; clientId: string; adminId?: string | null }
   | { t: "model_state"; state: ModelState }
   | { t: "grab_granted"; ownerID: string }
-  | { t: "grab_released"; clientId: string };
+  | { t: "grab_released"; clientId: string }
+  | { t: "admin_changed"; adminId: string | null };
 
 type ClientMessage =
   | { t: "hello"; clientId: string; markerID?: string | null }
@@ -110,6 +111,8 @@ export function makeNetworkSyncSystem(
     private cameraHorizontalFovDeg = opts.cameraHorizontalFovDeg || 63;
     private markerHoverMeters = opts.markerHoverMeters || 0.03;
     private initialMarkerOffsetMeters = opts.initialMarkerOffsetMeters || 0.15;
+    private adminId: string | null = null;
+    private isAdmin = false;
     // Jitter suppression thresholds
     private positionEpsilon = opts.positionEpsilon || 0.01; // meters
     private rotationEpsilon = opts.rotationEpsilon || 0.02; // radians (~1.1 deg)
@@ -807,10 +810,13 @@ export function makeNetworkSyncSystem(
 
     handleMessage(message: ServerMessage) {
       if (message.t === "welcome") {
+        console.log("[Network] welcome", message);
         this.clientId =
           typeof message.clientId === "string" && message.clientId.trim()
             ? message.clientId
             : this.makeFallbackClientId();
+        this.adminId = (message as any).adminId || null;
+        this.isAdmin = this.adminId === this.clientId;
         this.debugState = { ...this.debugState, joinedAs: this.clientId };
         this.updateDebug(true);
         if (this.markerID) {
@@ -829,6 +835,9 @@ export function makeNetworkSyncSystem(
       }
 
       if (message.t === "model_state") {
+        // server may include adminId with state broadcasts
+        this.adminId = (message as any).adminId || this.adminId;
+        this.isAdmin = this.adminId === this.clientId;
         const state = this.resolveStateForLocalMarker(message.state);
         this.sharedModelStateReceived = true;
         if (this.initialPlacementTimer) {
@@ -871,6 +880,14 @@ export function makeNetworkSyncSystem(
           ...this.debugState,
           grabReleased: message.clientId,
         };
+        this.updateDebug(true);
+        return;
+      }
+      if (message.t === "admin_changed") {
+        console.log("[Network] admin_changed", message);
+        this.adminId = message.adminId;
+        this.isAdmin = this.adminId === this.clientId;
+        this.debugState = { ...this.debugState, adminId: this.adminId };
         this.updateDebug(true);
         return;
       }
@@ -922,8 +939,11 @@ export function makeNetworkSyncSystem(
       if (!force && now - this.lastDebugUpdate < 200) return;
       this.lastDebugUpdate = now;
 
-      // Show only the connected user id in the overlay (labelled "User id")
-      this.debugEl.textContent = `User id: ${this.clientId || "-"}`;
+      // Show the connected user id and admin status in the overlay
+      const uid = this.clientId || "-";
+      const me = this.isAdmin ? " (admin)" : "";
+      const adminLine = this.adminId ? `Admin: ${this.adminId}` : "Admin: -";
+      this.debugEl.textContent = `User id: ${uid}${me}\n${adminLine}`;
     }
 
     update() {
