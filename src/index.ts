@@ -9,6 +9,7 @@ import {
   Transform,
 } from "@iwsdk/core";
 import { makeModelUniformScaleSystem } from "./uniformScaleModel";
+import { makeNetworkSyncSystem } from "./sync/networkSystem";
 
 const assets: AssetManifest = {
   model: {
@@ -38,6 +39,7 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
     physics: false,
     sceneUnderstanding: true,
     environmentRaycast: true,
+    camera: true,
   },
 }).then((world) => {
   const { camera } = world;
@@ -45,14 +47,18 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
 
   const { scene: modelMesh } = AssetManager.getGLTF("model")!;
   modelMesh.position.set(0, 1, -2);
-  modelMesh.scale.setScalar(1);
+  modelMesh.scale.setScalar(0.2);
+  // Hide the model until a QR marker is scanned and placement is known
+  modelMesh.visible = false;
 
+  // Create the entity now but keep the mesh hidden until placement is applied.
   const entity = world
     .createTransformEntity(modelMesh)
     .addComponent(DistanceGrabbable, {
       movementMode: MovementMode.MoveFromTarget,
     });
 
-  // Register the system so its update() runs each frame
+  // Register the uniform scale helper and the networking sync system
   world.registerSystem(makeModelUniformScaleSystem(modelMesh));
+  world.registerSystem(makeNetworkSyncSystem(entity, modelMesh));
 });

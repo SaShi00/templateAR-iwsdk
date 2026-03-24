@@ -64,3 +64,5 @@ coverage/
 public/gltf/generated/
 public/glxf/
 public/ui/
+
+model_state.json
