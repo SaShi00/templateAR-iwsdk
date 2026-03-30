@@ -23,12 +23,6 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 8081,
     open: true,
-    proxy: {
-      "/room": {
-        target: "ws://localhost:8787",
-        ws: true,
-      },
-    },
   },
   build: {
     outDir: "dist",

@@ -3,13 +3,13 @@ import {
   AssetType,
   SessionMode,
   AssetManager,
-  World,
+  Object3D,
   DistanceGrabbable,
   MovementMode,
-  Transform,
+  World,
 } from "@iwsdk/core";
+import { makeQrAnchorSystem } from "./qrAnchorSystem";
 import { makeModelUniformScaleSystem } from "./uniformScaleModel";
-import { makeNetworkSyncSystem } from "./sync/networkSystem";
 
 const assets: AssetManifest = {
   model: {
@@ -35,7 +35,9 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
   },
   features: {
     locomotion: false,
-    grabbing: true,
+    grabbing: {
+      useHandPinchForGrab: true,
+    },
     physics: false,
     sceneUnderstanding: true,
     environmentRaycast: true,
@@ -45,20 +47,41 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
   const { camera } = world;
   camera.position.set(0, 1, 0.5);
 
+  const qrAnchor = new Object3D();
+  qrAnchor.name = "qr-anchor";
+  const anchorEntity = world.createTransformEntity(qrAnchor);
+
   const { scene: modelMesh } = AssetManager.getGLTF("model")!;
-  modelMesh.position.set(0, 1, -2);
+  modelMesh.name = "qr-model";
+  modelMesh.position.set(0, 0, 0);
   modelMesh.scale.setScalar(0.2);
-  // Hide the model until a QR marker is scanned and placement is known
   modelMesh.visible = false;
 
-  // Create the entity now but keep the mesh hidden until placement is applied.
   const entity = world
-    .createTransformEntity(modelMesh)
+    .createTransformEntity(modelMesh, { parent: anchorEntity })
     .addComponent(DistanceGrabbable, {
       movementMode: MovementMode.MoveFromTarget,
+      rotate: true,
+      translate: true,
+      translateMin: [0, 0, -0.1],
+      translateMax: [0, 0, 0.1],
+      scale: true,
     });
 
-  // Register the uniform scale helper and the networking sync system
-  world.registerSystem(makeModelUniformScaleSystem(modelMesh));
-  world.registerSystem(makeNetworkSyncSystem(entity, modelMesh));
+  world.registerSystem(
+    makeQrAnchorSystem({
+      anchor: qrAnchor,
+      model: modelMesh,
+      markerPhysicalSizeMeters: 0.145,
+      scanIntervalMs: 200,
+    }),
+  );
+  world.registerSystem(
+    makeModelUniformScaleSystem(modelMesh, {
+      lockedLocalPosition: [0, 0, 0],
+      lockPositionAxes: [true, true, false],
+      minScale: 0.1,
+      maxScale: 2,
+    }),
+  );
 });
