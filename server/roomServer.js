@@ -10,8 +10,8 @@ console.log(`room server listening on ws://localhost:${PORT}`);
 
 // Simple in-memory room state
 const clients = new Map();
-let modelState = null;
-let currentOwner = null;
+const objectStates = new Map();
+const objectOwners = new Map();
 let adminId = null;
 let roomMarkerID = null;
 let roomMarkerCornersWorld = null;
@@ -80,32 +80,42 @@ wss.on("connection", (ws) => {
           );
         }
       }
-      if (
-        modelState &&
-        msg.markerID &&
-        (!roomMarkerID || roomMarkerID === msg.markerID)
-      )
+      if (msg.objectId && objectStates.has(msg.objectId)) {
         ws.send(
-          JSON.stringify({ t: "model_state", state: modelState, adminId }),
+          JSON.stringify({
+            t: "model_state",
+            state: objectStates.get(msg.objectId),
+            adminId,
+          }),
         );
+      }
     } else if (msg.t === "grab_request") {
       // don't log grab_request to avoid chatter; behavior unchanged
       // grant immediately for simplicity if no owner
-      if (!currentOwner) {
-        currentOwner = id;
-        broadcast({ t: "grab_granted", ownerID: currentOwner });
+      if (!msg.objectId) {
+        return;
+      }
+      if (!objectOwners.has(msg.objectId)) {
+        objectOwners.set(msg.objectId, id);
+        broadcast({ t: "grab_granted", objectId: msg.objectId, ownerID: id });
       } else {
         // deny by ignoring; could implement queue
         // denied - intentionally no noisy log
       }
     } else if (msg.t === "grab_released") {
       // don't log grab_released events
-      if (currentOwner === id) {
-        currentOwner = null;
-        broadcast({ t: "grab_released", clientId: id });
+      if (msg.objectId && objectOwners.get(msg.objectId) === id) {
+        objectOwners.delete(msg.objectId);
+        broadcast({ t: "grab_released", objectId: msg.objectId, clientId: id });
       }
     } else if (msg.t === "model_update") {
-      console.log(`[Room] model_update from ${id} owner=${currentOwner}`);
+      const objectId = msg.state && msg.state.id ? msg.state.id : null;
+      console.log(
+        `[Room] model_update from ${id} object=${objectId || "unknown"}`,
+      );
+      if (!objectId) {
+        return;
+      }
       // update authoritative state and broadcast to others
       // If this update includes marker corner info, only accept it if we
       // haven't already recorded marker corners for this room (first scanner).
@@ -120,20 +130,23 @@ wss.on("connection", (ws) => {
         console.log(`[Room] stored marker corners from ${id}`);
       }
 
-      modelState = msg.state;
-      modelState.ownerID = msg.state.ownerID;
-      modelState.isLocked = true;
+      objectStates.set(objectId, msg.state);
+      const state = objectStates.get(objectId);
+      state.ownerID = msg.state.ownerID;
+      state.isLocked = true;
       if (msg.state.markerID) {
         roomMarkerID = msg.state.markerID;
       }
-      broadcast({ t: "model_state", state: modelState, adminId }, msg.clientId);
+      broadcast({ t: "model_state", state, adminId }, msg.clientId);
       // write debug JSON so you can inspect model state in realtime
       try {
         await fs.writeFile(
           new URL("./model_state.json", import.meta.url),
           JSON.stringify(
             {
-              modelState,
+              modelState: objectStates.get("model-1") || null,
+              arrowState: objectStates.get("arrow-1") || null,
+              objectStates: Object.fromEntries(objectStates.entries()),
               roomMarker: {
                 markerID: roomMarkerID,
                 cornersWorld: roomMarkerCornersWorld,
@@ -151,10 +164,14 @@ wss.on("connection", (ws) => {
       }
     } else if (msg.t === "get_state") {
       // client explicitly requests current model state
-      if (modelState) {
+      if (msg.objectId && objectStates.has(msg.objectId)) {
         try {
           ws.send(
-            JSON.stringify({ t: "model_state", state: modelState, adminId }),
+            JSON.stringify({
+              t: "model_state",
+              state: objectStates.get(msg.objectId),
+              adminId,
+            }),
           );
         } catch (e) {}
       }
@@ -165,9 +182,11 @@ wss.on("connection", (ws) => {
     clients.delete(id);
     // membership changed -> compact summary log
     logActiveUsers();
-    if (currentOwner === id) {
-      currentOwner = null;
-      broadcast({ t: "grab_released", clientId: id });
+    for (const [objectId, owner] of objectOwners.entries()) {
+      if (owner === id) {
+        objectOwners.delete(objectId);
+        broadcast({ t: "grab_released", objectId, clientId: id });
+      }
     }
     // If admin disconnected, promote next connected client (if any)
     if (adminId === id) {
@@ -184,7 +203,14 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/model_state.json") {
     res.setHeader("Content-Type", "application/json");
     res.writeHead(200);
-    res.end(JSON.stringify({ modelState, lastUpdated: Date.now() }));
+    res.end(
+      JSON.stringify({
+        modelState: objectStates.get("model-1") || null,
+        arrowState: objectStates.get("arrow-1") || null,
+        objectStates: Object.fromEntries(objectStates.entries()),
+        lastUpdated: Date.now(),
+      }),
+    );
     return;
   }
   res.writeHead(404);

@@ -2,16 +2,16 @@ import {
   createSystem,
   CameraSource,
   CameraUtils,
+  DistanceGrabbable,
   Matrix4,
+  MovementMode,
   Object3D,
   Quaternion,
   Vector3,
-  DistanceGrabbable,
-  MovementMode,
 } from "@iwsdk/core";
 import jsQR from "jsqr";
 
-type ModelState = {
+type ObjectState = {
   id: string;
   markerID?: string | null;
   pos: [number, number, number];
@@ -25,14 +25,6 @@ type ModelState = {
   markerSizeMeters?: number;
   modelMarkerPosLocal?: [number, number, number];
   modelMarkerRotLocal?: [number, number, number, number];
-};
-
-type AnchorState = {
-  markerID: string;
-  pos: [number, number, number];
-  rot: [number, number, number, number];
-  clientId: string;
-  timestamp: number;
 };
 
 type QRScanSample = {
@@ -57,23 +49,41 @@ type MarkerPoseEstimate = {
 
 type ServerMessage =
   | { t: "welcome"; clientId: string; adminId?: string | null }
-  | { t: "model_state"; state: ModelState }
-  | { t: "grab_granted"; ownerID: string }
-  | { t: "grab_released"; clientId: string }
+  | { t: "model_state"; state: ObjectState; adminId?: string | null }
+  | { t: "grab_granted"; objectId: string; ownerID: string }
+  | { t: "grab_released"; objectId: string; clientId: string }
   | { t: "admin_changed"; adminId: string | null };
 
 type ClientMessage =
-  | { t: "hello"; clientId: string; markerID?: string | null }
-  | { t: "grab_request"; clientId: string }
-  | { t: "grab_released"; clientId: string }
-  | { t: "model_update"; clientId: string; state: ModelState }
-  | { t: "get_state"; clientId: string };
+  | { t: "hello"; clientId: string; objectId: string; markerID?: string | null }
+  | { t: "grab_request"; clientId: string; objectId: string }
+  | { t: "grab_released"; clientId: string; objectId: string }
+  | { t: "model_update"; clientId: string; state: ObjectState }
+  | { t: "get_state"; clientId: string; objectId: string };
+
+type NetworkSyncOptions = {
+  objectId?: string;
+  serverPath?: string;
+  serverUrl?: string;
+  sendInterval?: number;
+  releaseTimeout?: number;
+  markerPhysicalSizeMeters?: number;
+  cameraHorizontalFovDeg?: number;
+  markerHoverMeters?: number;
+  initialMarkerOffsetMeters?: number;
+  positionEpsilon?: number;
+  rotationEpsilon?: number;
+  scaleEpsilon?: number;
+  enableSmoothing?: boolean;
+  smoothingFactor?: number;
+};
 
 export function makeNetworkSyncSystem(
-  modelEntity: any,
-  modelMesh: any,
-  opts: any = {},
+  objectEntity: any,
+  objectMesh: any,
+  opts: NetworkSyncOptions = {},
 ) {
+  const objectId = opts.objectId || "model-1";
   const serverPath = opts.serverPath || "/room";
   const serverUrl =
     opts.serverUrl ||
@@ -82,7 +92,7 @@ export function makeNetworkSyncSystem(
   const releaseTimeout = opts.releaseTimeout || 500;
 
   return class NetworkSyncSystem extends createSystem({}, {}) {
-    private modelEntity: any = null;
+    private objectEntity: any = null;
     private socket: WebSocket | null = null;
     private debugEl: HTMLPreElement | null = null;
     private debugState: Record<string, unknown> = {};
@@ -102,21 +112,19 @@ export function makeNetworkSyncSystem(
     private lastMarkerScan = 0;
     private markerScanInterval = 250;
     private markerHelloSent = false;
-    private sharedModelStateReceived = false;
+    private sharedStateReceived = false;
     private pendingInitialPlacement: QRScanSample | null = null;
     private initialPlacementTimer: number | null = null;
     private initialPlacementPublished = false;
     private currentMarkerPose: MarkerPoseEstimate | null = null;
     private markerPhysicalSizeMeters = opts.markerPhysicalSizeMeters || 0.145;
     private cameraHorizontalFovDeg = opts.cameraHorizontalFovDeg || 63;
-    private markerHoverMeters = opts.markerHoverMeters || 0.03;
     private initialMarkerOffsetMeters = opts.initialMarkerOffsetMeters || 0.15;
     private adminId: string | null = null;
     private isAdmin = false;
-    // Jitter suppression thresholds
-    private positionEpsilon = opts.positionEpsilon || 0.01; // meters
-    private rotationEpsilon = opts.rotationEpsilon || 0.02; // radians (~1.1 deg)
-    private scaleEpsilon = opts.scaleEpsilon || 0.005; // relative
+    private positionEpsilon = opts.positionEpsilon || 0.01;
+    private rotationEpsilon = opts.rotationEpsilon || 0.02;
+    private scaleEpsilon = opts.scaleEpsilon || 0.005;
     private enableSmoothing =
       opts.enableSmoothing !== undefined ? opts.enableSmoothing : true;
     private smoothingFactor = opts.smoothingFactor || 0.25;
@@ -126,19 +134,21 @@ export function makeNetworkSyncSystem(
     }
 
     init() {
-      // If the caller provided an entity (created at startup), use it so
-      // the grabbing component is already registered with the world.
-      if (modelEntity) this.modelEntity = modelEntity;
-      this.lastPosition.copy(modelMesh.position);
-      this.lastQuaternion.copy(modelMesh.quaternion);
-      this.lastScale = modelMesh.scale.x;
+      if (objectEntity) this.objectEntity = objectEntity;
+      this.lastPosition.copy(objectMesh.position);
+      this.lastQuaternion.copy(objectMesh.quaternion);
+      this.lastScale = objectMesh.scale.x;
 
       this.createCameraProbe();
 
       this.socket = new WebSocket(serverUrl);
       this.socket.addEventListener("open", () => {
-        console.log("[Network] connecting to room", serverUrl);
-        this.send({ t: "hello", clientId: this.clientId || "pending" });
+        console.log("[Network] connecting to room", serverUrl, objectId);
+        this.send({
+          t: "hello",
+          clientId: this.clientId || "pending",
+          objectId,
+        });
       });
 
       this.socket.addEventListener("message", (event) => {
@@ -151,7 +161,7 @@ export function makeNetworkSyncSystem(
       });
 
       this.socket.addEventListener("close", () => {
-        console.log("[Network] disconnected");
+        console.log("[Network] disconnected", objectId);
       });
 
       this.createDebugOverlay();
@@ -161,27 +171,30 @@ export function makeNetworkSyncSystem(
     createDebugOverlay() {
       try {
         this.debugEl = document.createElement("pre");
-        this.debugEl.id = "multiplayer-debug";
+        this.debugEl.id = `multiplayer-debug-${objectId}`;
         Object.assign(this.debugEl.style, {
           position: "fixed",
           right: "8px",
-          bottom: "8px",
+          bottom: objectId === "model-1" ? "8px" : "180px",
           width: "340px",
           maxHeight: "45vh",
           overflow: "auto",
           background: "rgba(0,0,0,0.72)",
-          color: "#66ff99",
+          color: objectId === "model-1" ? "#66ff99" : "#ff6666",
           fontFamily: "monospace",
           fontSize: "12px",
           lineHeight: "1.35",
           padding: "8px",
-          border: "1px solid rgba(102, 255, 153, 0.35)",
+          border:
+            objectId === "model-1"
+              ? "1px solid rgba(102, 255, 153, 0.35)"
+              : "1px solid rgba(255, 102, 102, 0.35)",
           borderRadius: "6px",
           zIndex: "99999",
           whiteSpace: "pre-wrap",
           pointerEvents: "none",
         });
-        this.debugEl.textContent = "waiting for network...";
+        this.debugEl.textContent = `${objectId}: waiting for network...`;
         document.body.appendChild(this.debugEl);
       } catch {
         this.debugEl = null;
@@ -194,9 +207,7 @@ export function makeNetworkSyncSystem(
     }
 
     createCameraProbe() {
-      if (this.cameraEntity) {
-        return;
-      }
+      if (this.cameraEntity) return;
 
       const cameraObject = new Object3D();
       cameraObject.visible = false;
@@ -219,28 +230,20 @@ export function makeNetworkSyncSystem(
 
       this.lastMarkerScan = now;
       const canvas = CameraUtils.captureFrame(this.cameraEntity);
-      if (!canvas) {
-        return;
-      }
+      if (!canvas) return;
 
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) {
-        return;
-      }
+      if (!ctx) return;
 
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const qrCode = jsQR(imageData.data, canvas.width, canvas.height, {
         inversionAttempts: "dontInvert",
       });
 
-      if (!qrCode?.data) {
-        return;
-      }
+      if (!qrCode?.data) return;
 
       const scannedMarkerID = qrCode.data.trim();
-      if (!scannedMarkerID || scannedMarkerID === this.markerID) {
-        return;
-      }
+      if (!scannedMarkerID || scannedMarkerID === this.markerID) return;
 
       const location = qrCode.location;
       const topWidth = Math.hypot(
@@ -296,9 +299,7 @@ export function makeNetworkSyncSystem(
       this.currentMarkerPose = this.solveMarkerPose(
         this.pendingInitialPlacement,
       );
-      if (!this.currentMarkerPose) {
-        return;
-      }
+      if (!this.currentMarkerPose) return;
 
       this.markerID = scannedMarkerID;
       this.debugState = { ...this.debugState, markerID: this.markerID };
@@ -309,22 +310,24 @@ export function makeNetworkSyncSystem(
         this.send({
           t: "hello",
           clientId: this.clientId,
+          objectId,
           markerID: this.markerID,
         });
       }
 
-      if (!this.sharedModelStateReceived && !this.initialPlacementTimer) {
-        // Ask server for existing state (if any) to avoid racing and
-        // possibly overwriting an existing canonical placement.
+      if (!this.sharedStateReceived && !this.initialPlacementTimer) {
         try {
-          this.send({ t: "get_state", clientId: this.clientId || "pending" });
+          this.send({
+            t: "get_state",
+            clientId: this.clientId || "pending",
+            objectId,
+          });
         } catch {}
 
-        // Wait a bit longer for the server to respond before publishing.
         this.initialPlacementTimer = window.setTimeout(() => {
           this.initialPlacementTimer = null;
           if (
-            this.sharedModelStateReceived ||
+            this.sharedStateReceived ||
             this.initialPlacementPublished ||
             !this.pendingInitialPlacement ||
             !this.clientId
@@ -339,9 +342,7 @@ export function makeNetworkSyncSystem(
 
     publishInitialPlacement(sample: QRScanSample) {
       const markerMeasurement = this.estimateMarkerPlacement(sample);
-      if (!markerMeasurement || !this.clientId) {
-        return;
-      }
+      if (!markerMeasurement || !this.clientId) return;
 
       this.initialPlacementPublished = true;
       this.isOwner = true;
@@ -364,9 +365,7 @@ export function makeNetworkSyncSystem(
       sample: QRScanSample,
     ): [number, number, number][] | null {
       const markerPose = this.solveMarkerPose(sample);
-      if (!markerPose) {
-        return null;
-      }
+      if (!markerPose) return null;
 
       const markerSize = this.markerPhysicalSizeMeters;
       const localCorners = [
@@ -388,9 +387,7 @@ export function makeNetworkSyncSystem(
       const bottomRight = sample.bottomRight;
       const bottomLeft = sample.bottomLeft;
 
-      if (!topLeft || !topRight || !bottomRight || !bottomLeft) {
-        return null;
-      }
+      if (!topLeft || !topRight || !bottomRight || !bottomLeft) return null;
 
       const fieldOfViewRad = (this.cameraHorizontalFovDeg * Math.PI) / 180;
       const focalLengthPx = sample.width / (2 * Math.tan(fieldOfViewRad / 2));
@@ -405,9 +402,7 @@ export function makeNetworkSyncSystem(
         { X: 0, Y: markerSize, u: bottomLeft.x, v: bottomLeft.y },
       ]);
 
-      if (!homography) {
-        return null;
-      }
+      if (!homography) return null;
 
       const h00 = homography[0];
       const h01 = homography[1];
@@ -616,9 +611,7 @@ export function makeNetworkSyncSystem(
       ];
 
       const solution = this.solveGaussian(rows, vector);
-      if (!solution) {
-        return null;
-      }
+      if (!solution) return null;
 
       return [
         solution[0],
@@ -648,9 +641,7 @@ export function makeNetworkSyncSystem(
           }
         }
 
-        if (Math.abs(augmented[bestRow][pivot]) < 1e-8) {
-          return null;
-        }
+        if (Math.abs(augmented[bestRow][pivot]) < 1e-8) return null;
 
         if (bestRow !== pivot) {
           const swap = augmented[pivot];
@@ -676,11 +667,9 @@ export function makeNetworkSyncSystem(
       return augmented.map((row) => row[size]);
     }
 
-    withMarkerLocalPose(state: ModelState): ModelState {
+    withMarkerLocalPose(state: ObjectState): ObjectState {
       const markerPose = this.currentMarkerPose;
-      if (!markerPose) {
-        return state;
-      }
+      if (!markerPose) return state;
 
       const worldMatrix = new Matrix4().compose(
         new Vector3(state.pos[0], state.pos[1], state.pos[2]),
@@ -714,11 +703,9 @@ export function makeNetworkSyncSystem(
       };
     }
 
-    resolveStateForLocalMarker(state: ModelState): ModelState {
+    resolveStateForLocalMarker(state: ObjectState): ObjectState {
       const markerPose = this.currentMarkerPose;
-      if (!state.modelMarkerPosLocal || !markerPose) {
-        return state;
-      }
+      if (!state.modelMarkerPosLocal || !markerPose) return state;
 
       const localPosition = new Vector3(
         state.modelMarkerPosLocal[0],
@@ -762,11 +749,9 @@ export function makeNetworkSyncSystem(
       };
     }
 
-    estimateMarkerPlacement(sample: QRScanSample): ModelState | null {
+    estimateMarkerPlacement(sample: QRScanSample): ObjectState | null {
       const markerPose = this.currentMarkerPose || this.solveMarkerPose(sample);
-      if (!markerPose) {
-        return null;
-      }
+      if (!markerPose) return null;
 
       const worldPosition = new Vector3(
         this.initialMarkerOffsetMeters,
@@ -776,9 +761,7 @@ export function makeNetworkSyncSystem(
       const worldQuaternion = markerPose.quaternion.clone();
 
       const cornerWorlds = this.estimateMarkerCornersWorld(sample);
-      if (!cornerWorlds) {
-        return null;
-      }
+      if (!cornerWorlds) return null;
 
       const markerSize = this.markerPhysicalSizeMeters;
       const markerCornersLocal: [number, number, number][] = [
@@ -789,7 +772,7 @@ export function makeNetworkSyncSystem(
       ];
 
       return {
-        id: "model-1",
+        id: objectId,
         markerID: sample.markerID,
         pos: [worldPosition.x, worldPosition.y, worldPosition.z],
         rot: [
@@ -798,7 +781,7 @@ export function makeNetworkSyncSystem(
           worldQuaternion.z,
           worldQuaternion.w,
         ],
-        scale: modelMesh.scale.x,
+        scale: objectMesh.scale.x,
         isLocked: true,
         ownerID: this.clientId,
         timestamp: Date.now(),
@@ -810,12 +793,11 @@ export function makeNetworkSyncSystem(
 
     handleMessage(message: ServerMessage) {
       if (message.t === "welcome") {
-        console.log("[Network] welcome", message);
         this.clientId =
           typeof message.clientId === "string" && message.clientId.trim()
             ? message.clientId
             : this.makeFallbackClientId();
-        this.adminId = (message as any).adminId || null;
+        this.adminId = message.adminId || null;
         this.isAdmin = this.adminId === this.clientId;
         this.debugState = { ...this.debugState, joinedAs: this.clientId };
         this.updateDebug(true);
@@ -824,22 +806,22 @@ export function makeNetworkSyncSystem(
           this.send({
             t: "hello",
             clientId: this.clientId,
+            objectId,
             markerID: this.markerID,
           });
         }
         return;
       }
 
-      if (!this.clientId) {
-        return;
-      }
+      if (!this.clientId) return;
 
       if (message.t === "model_state") {
-        // server may include adminId with state broadcasts
-        this.adminId = (message as any).adminId || this.adminId;
+        if (message.state.id !== objectId) return;
+
+        this.adminId = message.adminId || this.adminId;
         this.isAdmin = this.adminId === this.clientId;
         const state = this.resolveStateForLocalMarker(message.state);
-        this.sharedModelStateReceived = true;
+        this.sharedStateReceived = true;
         if (this.initialPlacementTimer) {
           window.clearTimeout(this.initialPlacementTimer);
           this.initialPlacementTimer = null;
@@ -857,13 +839,14 @@ export function makeNetworkSyncSystem(
 
         this.ownerID = state.ownerID || null;
         this.isLocked = Boolean(state.isLocked);
-        this.applyRemoteState(state, !modelMesh.visible);
+        this.applyRemoteState(state, !objectMesh.visible);
         this.debugState = { ...this.debugState, incoming: state };
         this.updateDebug();
         return;
       }
 
       if (message.t === "grab_granted") {
+        if (message.objectId !== objectId) return;
         this.ownerID = message.ownerID;
         this.isOwner = message.ownerID === this.clientId;
         this.isLocked = true;
@@ -873,6 +856,7 @@ export function makeNetworkSyncSystem(
       }
 
       if (message.t === "grab_released") {
+        if (message.objectId !== objectId) return;
         this.isOwner = false;
         this.isLocked = false;
         this.ownerID = null;
@@ -883,28 +867,26 @@ export function makeNetworkSyncSystem(
         this.updateDebug(true);
         return;
       }
+
       if (message.t === "admin_changed") {
-        console.log("[Network] admin_changed", message);
         this.adminId = message.adminId;
         this.isAdmin = this.adminId === this.clientId;
         this.debugState = { ...this.debugState, adminId: this.adminId };
         this.updateDebug(true);
-        return;
       }
     }
 
-    applyRemoteState(state: ModelState, preserveRotation = false) {
+    applyRemoteState(state: ObjectState, preserveRotation = false) {
       this.applyingRemoteState = true;
-      // Ensure the mesh is visible and attached to the world as an entity
-      if (!modelMesh.visible) modelMesh.visible = true;
-      if (!this.modelEntity) {
-        this.modelEntity = this.world.createTransformEntity(modelMesh);
+      if (!objectMesh.visible) objectMesh.visible = true;
+      if (!this.objectEntity) {
+        this.objectEntity = this.world.createTransformEntity(objectMesh);
         try {
-          this.modelEntity.addComponent(DistanceGrabbable, {
+          this.objectEntity.addComponent(DistanceGrabbable, {
             movementMode: MovementMode.MoveFromTarget,
           });
         } catch {
-          // ignore if component registration fails in non-XR contexts
+          // Ignore if the component cannot be registered in the current context.
         }
       }
 
@@ -914,7 +896,7 @@ export function makeNetworkSyncSystem(
         state.pos[2],
       );
       const incomingQuaternion = preserveRotation
-        ? modelMesh.quaternion.clone()
+        ? objectMesh.quaternion.clone()
         : new Quaternion(
             state.rot[0],
             state.rot[1],
@@ -922,14 +904,13 @@ export function makeNetworkSyncSystem(
             state.rot[3],
           );
 
-      // Apply position and (conditionally) rotation
-      modelMesh.position.copy(incomingPosition);
-      modelMesh.quaternion.copy(incomingQuaternion);
-      modelMesh.scale.setScalar(state.scale);
+      objectMesh.position.copy(incomingPosition);
+      objectMesh.quaternion.copy(incomingQuaternion);
+      objectMesh.scale.setScalar(state.scale);
 
-      this.lastPosition.copy(modelMesh.position);
-      this.lastQuaternion.copy(modelMesh.quaternion);
-      this.lastScale = modelMesh.scale.x;
+      this.lastPosition.copy(objectMesh.position);
+      this.lastQuaternion.copy(objectMesh.quaternion);
+      this.lastScale = objectMesh.scale.x;
       this.applyingRemoteState = false;
     }
 
@@ -939,11 +920,10 @@ export function makeNetworkSyncSystem(
       if (!force && now - this.lastDebugUpdate < 200) return;
       this.lastDebugUpdate = now;
 
-      // Show the connected user id and admin status in the overlay
       const uid = this.clientId || "-";
       const me = this.isAdmin ? " (admin)" : "";
       const adminLine = this.adminId ? `Admin: ${this.adminId}` : "Admin: -";
-      this.debugEl.textContent = `User id: ${uid}${me}\n${adminLine}`;
+      this.debugEl.textContent = `${objectId}\nUser id: ${uid}${me}\n${adminLine}`;
     }
 
     update() {
@@ -956,9 +936,9 @@ export function makeNetworkSyncSystem(
       this.scanMarker(now);
 
       const moved =
-        !modelMesh.position.equals(this.lastPosition) ||
-        !modelMesh.quaternion.equals(this.lastQuaternion) ||
-        modelMesh.scale.x !== this.lastScale;
+        !objectMesh.position.equals(this.lastPosition) ||
+        !objectMesh.quaternion.equals(this.lastQuaternion) ||
+        objectMesh.scale.x !== this.lastScale;
 
       if (moved && !this.applyingRemoteState) {
         this.lastMoveTime = now;
@@ -970,25 +950,25 @@ export function makeNetworkSyncSystem(
         !this.isLocked &&
         !this.applyingRemoteState
       ) {
-        this.send({ t: "grab_request", clientId: this.clientId });
+        this.send({ t: "grab_request", clientId: this.clientId, objectId });
       }
 
       if (this.isOwner && now - this.lastSend >= sendInterval) {
-        const state: ModelState = {
-          id: "model-1",
+        const state: ObjectState = {
+          id: objectId,
           markerID: this.markerID,
           pos: [
-            modelMesh.position.x,
-            modelMesh.position.y,
-            modelMesh.position.z,
+            objectMesh.position.x,
+            objectMesh.position.y,
+            objectMesh.position.z,
           ],
           rot: [
-            modelMesh.quaternion.x,
-            modelMesh.quaternion.y,
-            modelMesh.quaternion.z,
-            modelMesh.quaternion.w,
+            objectMesh.quaternion.x,
+            objectMesh.quaternion.y,
+            objectMesh.quaternion.z,
+            objectMesh.quaternion.w,
           ],
-          scale: modelMesh.scale.x,
+          scale: objectMesh.scale.x,
           isLocked: true,
           ownerID: this.clientId,
           timestamp: Date.now(),
@@ -1003,15 +983,15 @@ export function makeNetworkSyncSystem(
       }
 
       if (this.isOwner && now - this.lastMoveTime > releaseTimeout) {
-        this.send({ t: "grab_released", clientId: this.clientId });
+        this.send({ t: "grab_released", clientId: this.clientId, objectId });
         this.isOwner = false;
         this.isLocked = false;
         this.ownerID = null;
       }
 
-      this.lastPosition.copy(modelMesh.position);
-      this.lastQuaternion.copy(modelMesh.quaternion);
-      this.lastScale = modelMesh.scale.x;
+      this.lastPosition.copy(objectMesh.position);
+      this.lastQuaternion.copy(objectMesh.quaternion);
+      this.lastScale = objectMesh.scale.x;
       this.debugState = {
         ...this.debugState,
         markerID: this.markerID,
@@ -1025,4 +1005,4 @@ export function makeNetworkSyncSystem(
   };
 }
 
-export type { ModelState };
+export type { ObjectState };

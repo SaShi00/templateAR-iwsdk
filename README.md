@@ -2,15 +2,15 @@
 
 Multiplayer AR experience built with IWSDK.
 
-The app uses a QR code to anchor a shared 3D model in the room. One user scans the QR code, the client estimates the initial placement, and the room server broadcasts that shared state to every other client.
+The app uses a QR code to anchor a shared 3D model and a red arrow pointer in the room. One user scans the QR code, the client estimates the initial placement, and the room server broadcasts each shared object state to every other client.
 
 ## What it does
 
-- Loads a GLTF model into an AR scene.
+- Loads a GLTF model and a red arrow pointer into an AR scene.
 - Captures a back-facing camera stream and scans it with `jsQR`.
 - Uses the QR marker pose as the anchor for model placement.
-- Shares model state over a WebSocket room server.
-- Stores the latest shared model state in memory and writes a debug snapshot to disk.
+- Shares object state over a WebSocket room server.
+- Stores the latest shared object states in memory and writes a debug snapshot to disk.
 
 ## Project Structure
 
@@ -34,12 +34,12 @@ src/
 ## Runtime Flow
 
 1. `npm run dev` starts the Vite dev server on `https://localhost:8081`.
-2. `src/index.ts` creates the IWSDK world, loads the model, and registers the systems.
-3. `src/sync/networkSystem.ts` opens a WebSocket connection to `/room` and sends a `hello` message.
+2. `src/index.ts` creates the IWSDK world, loads the model and arrow, and registers the systems.
+3. `src/sync/networkSystem.ts` opens a WebSocket connection to `/room` and sends a `hello` message for each synced object.
 4. The system captures frames from the back camera and scans for a QR code.
 5. The first valid QR scan becomes the room marker and is used to estimate the initial pose.
 6. The client requests the current room state with `get_state` before publishing a new placement.
-7. `server/roomServer.js` keeps the authoritative room state in memory, broadcasts `model_state`, and writes `server/model_state.json` for debugging.
+7. `server/roomServer.js` keeps the authoritative room state in memory, broadcasts per-object `model_state` messages, and writes `server/model_state.json` for debugging.
 
 ## Multiplayer Sequence
 
@@ -65,8 +65,8 @@ sequenceDiagram
 
 ## Important Files
 
-- [src/index.ts](src/index.ts) creates the IWSDK world, loads the model, and registers systems.
-- [src/sync/networkSystem.ts](src/sync/networkSystem.ts) handles QR scanning, pose estimation, socket sync, and model updates.
+- [src/index.ts](src/index.ts) creates the IWSDK world, loads the model and arrow, and registers systems.
+- [src/sync/networkSystem.ts](src/sync/networkSystem.ts) handles QR scanning, pose estimation, socket sync, and per-object updates.
 - [src/uniformScaleModel.ts](src/uniformScaleModel.ts) keeps the model uniformly scaled.
 - [server/roomServer.js](server/roomServer.js) stores and broadcasts the shared room state and writes the debug JSON snapshot.
 
@@ -103,7 +103,7 @@ The QR code is used as an anchor, not as the shared room identity itself.
 
 - If `npm run server` fails with `EADDRINUSE`, another process is already using port `8787` or `8788`.
 - If the browser shows WebSocket errors for `/room`, make sure `npm run server` is running and reload the page.
-- If the model does not appear, confirm the QR code is visible to the camera and the room server has a shared `model_state`.
+- If the model or arrow does not appear, confirm the QR code is visible to the camera and the room server has shared object state.
 - If the debug snapshot is stale, open `http://localhost:8788/model_state.json` to confirm the server is receiving updates.
 
 ## Notes

@@ -6,10 +6,14 @@ import {
   World,
   DistanceGrabbable,
   MovementMode,
-  Transform,
+  Object3D,
+  Mesh,
+  MeshBasicMaterial,
+  CylinderGeometry,
+  ConeGeometry,
 } from "@iwsdk/core";
-import { makeModelUniformScaleSystem } from "./uniformScaleModel";
-import { makeNetworkSyncSystem } from "./sync/networkSystem";
+import { makeModelUniformScaleSystem } from "./uniformScaleModel.js";
+import { makeNetworkSyncSystem } from "./sync/networkSystem.js";
 
 const assets: AssetManifest = {
   model: {
@@ -58,7 +62,44 @@ World.create(document.getElementById("scene-container") as HTMLDivElement, {
       movementMode: MovementMode.MoveFromTarget,
     });
 
+  const arrowRoot = new Object3D();
+  const arrowBody = new Mesh(
+    new CylinderGeometry(0.015, 0.015, 0.42, 12),
+    new MeshBasicMaterial({ color: 0xff0000 }),
+  );
+  arrowBody.rotation.z = Math.PI / 2;
+  arrowBody.position.x = 0.21;
+
+  const arrowHead = new Mesh(
+    new ConeGeometry(0.06, 0.18, 16),
+    new MeshBasicMaterial({ color: 0xff0000 }),
+  );
+  arrowHead.rotation.z = -Math.PI / 2;
+  arrowHead.position.x = 0.39;
+
+  arrowRoot.add(arrowBody);
+  arrowRoot.add(arrowHead);
+  arrowRoot.position.set(0, 1, -1.4);
+  arrowRoot.scale.setScalar(0.25);
+  arrowRoot.visible = false;
+
+  const arrowEntity = world
+    .createTransformEntity(arrowRoot)
+    .addComponent(DistanceGrabbable, {
+      movementMode: MovementMode.MoveFromTarget,
+    });
+
   // Register the uniform scale helper and the networking sync system
   world.registerSystem(makeModelUniformScaleSystem(modelMesh));
-  world.registerSystem(makeNetworkSyncSystem(entity, modelMesh));
+  world.registerSystem(makeModelUniformScaleSystem(arrowRoot));
+  world.registerSystem(
+    makeNetworkSyncSystem(entity, modelMesh, {
+      objectId: "model-1",
+    }),
+  );
+  world.registerSystem(
+    makeNetworkSyncSystem(arrowEntity, arrowRoot, {
+      objectId: "arrow-1",
+    }),
+  );
 });
